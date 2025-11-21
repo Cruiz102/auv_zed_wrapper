@@ -2,6 +2,7 @@
 #include <sensor_msgs/image_encodings.hpp>
 #include <cmath>
 #include <set>
+#include <fstream>
 
 using namespace std::chrono_literals;
 
@@ -74,6 +75,10 @@ void ZedCustomNode::initZed() {
         init_params.coordinate_units = sl::UNIT::METER;
         init_params.coordinate_system = sl::COORDINATE_SYSTEM::RIGHT_HANDED_Z_UP_X_FWD;
         init_params.depth_mode = sl::DEPTH_MODE::NEURAL; // "Neural Light" requested
+        
+        // Force GPU usage (GPU ID 0 for Jetson Nano)
+        init_params.sdk_gpu_id = 0;
+        init_params.sdk_verbose = 1; // Enable verbose logging to see GPU usage
 
         std::string svo_path = this->get_parameter("svo_path").as_string();
         if (!svo_path.empty()) {
@@ -89,11 +94,15 @@ void ZedCustomNode::initZed() {
 
         init_params.camera_fps = this->get_parameter("fps").as_int();
 
+        RCLCPP_INFO(this->get_logger(), "Opening ZED with GPU ID: %d", init_params.sdk_gpu_id);
+        
         sl::ERROR_CODE err = zed_.open(init_params);
         if (err != sl::ERROR_CODE::SUCCESS) {
             RCLCPP_ERROR(this->get_logger(), "Failed to open ZED: %s", sl::toString(err).c_str());
             throw std::runtime_error("Failed to open ZED");
         }
+        
+        RCLCPP_INFO(this->get_logger(), "ZED Camera opened successfully on GPU %d", init_params.sdk_gpu_id);
 
         // Enable Positional Tracking (required for OD and Mapping)
         sl::PositionalTrackingParameters tracking_params;
@@ -106,28 +115,51 @@ void ZedCustomNode::initZed() {
         // Enable Object Detection with Custom Model
         std::string onnx_path = this->get_parameter("onnx_model_path").as_string();
         if (!onnx_path.empty()) {
-            RCLCPP_INFO(this->get_logger(), "Attempting to enable Object Detection with ONNX model: %s", onnx_path.c_str());
-            
-            sl::ObjectDetectionParameters od_params;
-            od_params.enable_tracking = true;
-            od_params.enable_segmentation = false;
-            // Use CUSTOM_YOLOLIKE_BOX_OBJECTS for YOLO models (not CUSTOM_BOX_OBJECTS)
-            od_params.detection_model = sl::OBJECT_DETECTION_MODEL::CUSTOM_YOLOLIKE_BOX_OBJECTS;
-            
-            // Set the custom ONNX file path
-            od_params.custom_onnx_file = sl::String(onnx_path.c_str());
-            
-            // Set the input size - YOLOv8n default is 640, but check your model
-            // This should match the imgsz used when exporting the ONNX model
-            od_params.custom_onnx_dynamic_input_shape = 640;
-            
-            err = zed_.enableObjectDetection(od_params);
-            if (err != sl::ERROR_CODE::SUCCESS) {
-                RCLCPP_ERROR(this->get_logger(), "Failed to enable Object Detection: %s", sl::toString(err).c_str());
+            // Check if file exists
+            std::ifstream onnx_file(onnx_path);
+            if (!onnx_file.good()) {
+                RCLCPP_ERROR(this->get_logger(), "ONNX model file not found: %s", onnx_path.c_str());
+                RCLCPP_ERROR(this->get_logger(), "Object Detection will be DISABLED");
             } else {
-                RCLCPP_INFO(this->get_logger(), "Object Detection enabled with model: %s", onnx_path.c_str());
-                RCLCPP_INFO(this->get_logger(), "Object Detection configuration - Tracking: %s, Model: CUSTOM_YOLOLIKE_BOX_OBJECTS", 
-                    od_params.enable_tracking ? "enabled" : "disabled");
+                RCLCPP_INFO(this->get_logger(), "Attempting to enable Object Detection with ONNX model: %s", onnx_path.c_str());
+                
+                sl::ObjectDetectionParameters od_params;
+                od_params.enable_tracking = true;
+                od_params.enable_segmentation = false;
+                
+                // Use CUSTOM_YOLOLIKE_BOX_OBJECTS for YOLO models
+                od_params.detection_model = sl::OBJECT_DETECTION_MODEL::CUSTOM_YOLOLIKE_BOX_OBJECTS;
+                
+                // Set the custom ONNX file path - MUST be set BEFORE calling enableObjectDetection
+                od_params.custom_onnx_file = sl::String(onnx_path.c_str());
+                
+                // Set the input size - YOLOv8n default is 640x640
+                od_params.custom_onnx_dynamic_input_shape = sl::Resolution(640, 640);
+                
+                // CRITICAL: Force GPU inference (FP16 precision for Jetson Nano)
+                od_params.allow_reduced_precision_inference = true; // Use FP16 instead of FP32 for better performance
+                
+                // Limit max range to reduce processing load
+                od_params.max_range = 10.0f; // meters
+                
+                RCLCPP_INFO(this->get_logger(), "Object Detection params:");
+                RCLCPP_INFO(this->get_logger(), "  - Model file: %s", od_params.custom_onnx_file.get());
+                RCLCPP_INFO(this->get_logger(), "  - Input shape: %dx%d", 
+                    od_params.custom_onnx_dynamic_input_shape.width,
+                    od_params.custom_onnx_dynamic_input_shape.height);
+                RCLCPP_INFO(this->get_logger(), "  - Reduced precision (FP16): %s", 
+                    od_params.allow_reduced_precision_inference ? "enabled" : "disabled");
+                RCLCPP_INFO(this->get_logger(), "  - Max range: %.1f meters", od_params.max_range);
+                
+                err = zed_.enableObjectDetection(od_params);
+                if (err != sl::ERROR_CODE::SUCCESS) {
+                    RCLCPP_ERROR(this->get_logger(), "Failed to enable Object Detection: %s", sl::toString(err).c_str());
+                    RCLCPP_ERROR(this->get_logger(), "Make sure your ONNX model is compatible with ZED SDK");
+                    RCLCPP_ERROR(this->get_logger(), "Refer to: https://www.stereolabs.com/docs/object-detection/custom-od");
+                } else {
+                    RCLCPP_INFO(this->get_logger(), "Object Detection enabled successfully!");
+                    RCLCPP_INFO(this->get_logger(), "Running on GPU with FP16 precision for optimal Jetson Nano performance");
+                }
             }
         } else {
             RCLCPP_WARN(this->get_logger(), "No ONNX model path provided. Object Detection disabled.");
